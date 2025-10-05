@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Social App</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <nav class="navbar">
+    <div class="brand">Social</div>
+    <div class="nav-actions" id="navActions" hidden>
+      <span id="currentUser"></span>
+      <button id="logoutBtn" class="btn btn-secondary">Logout</button>
+    </div>
+  </nav>
+
+  <main class="container">
+    <section id="authSection" class="card">
+      <div class="tabs">
+        <button class="tab active" data-tab="login">Login</button>
+        <button class="tab" data-tab="register">Register</button>
+      </div>
+      <div class="tab-panels">
+        <form id="loginForm" class="tab-panel active">
+          <label>Username
+            <input name="username" placeholder="jane" required />
+          </label>
+          <label>Password
+            <input name="password" type="password" required />
+          </label>
+          <button class="btn btn-primary" type="submit">Login</button>
+        </form>
+        <form id="registerForm" class="tab-panel">
+          <label>Username
+            <input name="username" placeholder="jane" required />
+          </label>
+          <label>Email
+            <input name="email" type="email" placeholder="jane@example.com" />
+          </label>
+          <label>Password
+            <input name="password" type="password" required />
+          </label>
+          <button class="btn btn-primary" type="submit">Create account</button>
+        </form>
+      </div>
+    </section>
+
+    <section id="appSection" hidden>
+      <div class="layout">
+        <div class="col-main">
+          <div class="card compose">
+            <textarea id="composeInput" rows="3" placeholder="What's happening?"></textarea>
+            <div class="compose-actions">
+              <button id="postBtn" class="btn btn-primary">Post</button>
+            </div>
+          </div>
+          <div id="feed" class="feed"></div>
+          <button id="loadMoreBtn" class="btn btn-secondary full" hidden>Load more</button>
+        </div>
+        <aside class="col-side">
+          <div class="card">
+            <h3>Following</h3>
+            <ul id="followingList" class="list"></ul>
+          </div>
+          <div class="card">
+            <h3>Followers</h3>
+            <ul id="followersList" class="list"></ul>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

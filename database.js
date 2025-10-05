@@ -89,12 +89,64 @@ async function initializeTables() {
             )
         `);
 
+        // Social: posts table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS posts (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                username VARCHAR(50) NOT NULL,
+                content TEXT NOT NULL,
+                like_count INTEGER DEFAULT 0,
+                comment_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Social: comments table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                username VARCHAR(50) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Social: post likes table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS post_likes (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(post_id, user_id)
+            )
+        `);
+
+        // Social: follows table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS follows (
+                follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (follower_id, following_id)
+            )
+        `);
+
         // Create indexes for better performance
         await client.query(`
             CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_username ON messages(username);
             CREATE INDEX IF NOT EXISTS idx_chess_games_players ON chess_games(white_player, black_player);
             CREATE INDEX IF NOT EXISTS idx_user_sessions_socket ON user_sessions(socket_id);
+            CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_comments_post_id_created_at ON comments(post_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_post_likes_post_id ON post_likes(post_id);
+            CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+            CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
         `);
 
         console.log('✅ Database tables initialized successfully');
@@ -272,6 +324,176 @@ const db = {
 
     async removeSession(socketId) {
         await pool.query('DELETE FROM user_sessions WHERE socket_id = $1', [socketId]);
+    },
+
+    // Social: Posts
+    async createPost({ username, content }) {
+        const userResult = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        const user = userResult.rows[0];
+        if (!user) throw new Error('User not found');
+        const result = await pool.query(
+            `INSERT INTO posts (user_id, username, content) VALUES ($1, $2, $3) RETURNING *`,
+            [user.id, username, content]
+        );
+        return result.rows[0];
+    },
+
+    async getPostById(postId) {
+        const result = await pool.query('SELECT * FROM posts WHERE id = $1', [postId]);
+        return result.rows[0];
+    },
+
+    async deletePost(postId, username) {
+        const result = await pool.query('DELETE FROM posts WHERE id = $1 AND username = $2 RETURNING *', [postId, username]);
+        return result.rows[0];
+    },
+
+    async getUserPosts(username, limit = 20, beforeId = null) {
+        let query = `SELECT * FROM posts WHERE username = $1`;
+        const params = [username];
+        if (beforeId) {
+            query += ` AND id < $2`;
+            params.push(beforeId);
+        }
+        query += ` ORDER BY id DESC LIMIT $${params.length + 1}`;
+        params.push(limit);
+        const result = await pool.query(query, params);
+        return result.rows;
+    },
+
+    async getFeedForUser(username, limit = 30, beforeId = null) {
+        // Feed = posts by self + users they follow
+        const params = [username];
+        let query = `
+            SELECT p.*
+            FROM posts p
+            WHERE p.username = $1 OR p.user_id IN (
+                SELECT following_id FROM follows f
+                JOIN users u ON u.id = f.follower_id
+                WHERE u.username = $1
+            )
+        `;
+        if (beforeId) {
+            params.push(beforeId);
+            query += ` AND p.id < $${params.length}`;
+        }
+        params.push(limit);
+        query += ` ORDER BY p.id DESC LIMIT $${params.length}`;
+        const result = await pool.query(query, params);
+        return result.rows;
+    },
+
+    // Social: Comments
+    async addComment({ postId, username, content }) {
+        const userResult = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        const user = userResult.rows[0];
+        if (!user) throw new Error('User not found');
+        const result = await pool.query(
+            `INSERT INTO comments (post_id, user_id, username, content) VALUES ($1, $2, $3, $4) RETURNING *`,
+            [postId, user.id, username, content]
+        );
+        // increment comment_count
+        await pool.query('UPDATE posts SET comment_count = comment_count + 1 WHERE id = $1', [postId]);
+        return result.rows[0];
+    },
+
+    async getComments(postId, limit = 50, beforeId = null) {
+        const params = [postId];
+        let query = `SELECT * FROM comments WHERE post_id = $1`;
+        if (beforeId) {
+            params.push(beforeId);
+            query += ` AND id < $2`;
+        }
+        params.push(limit);
+        query += ` ORDER BY id DESC LIMIT $${params.length}`;
+        const result = await pool.query(query, params);
+        return result.rows.reverse();
+    },
+
+    // Social: Likes
+    async likePost({ postId, username }) {
+        const userResult = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        const user = userResult.rows[0];
+        if (!user) throw new Error('User not found');
+        await pool.query('INSERT INTO post_likes (post_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [postId, user.id]);
+        await pool.query('UPDATE posts SET like_count = (
+            SELECT COUNT(*) FROM post_likes WHERE post_id = $1
+        ) WHERE id = $1', [postId]);
+        const post = await this.getPostById(postId);
+        return post;
+    },
+
+    async unlikePost({ postId, username }) {
+        const userResult = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        const user = userResult.rows[0];
+        if (!user) throw new Error('User not found');
+        await pool.query('DELETE FROM post_likes WHERE post_id = $1 AND user_id = $2', [postId, user.id]);
+        await pool.query('UPDATE posts SET like_count = (
+            SELECT COUNT(*) FROM post_likes WHERE post_id = $1
+        ) WHERE id = $1', [postId]);
+        const post = await this.getPostById(postId);
+        return post;
+    },
+
+    async getPostLikes(postId, limit = 50) {
+        const result = await pool.query(`
+            SELECT u.username
+            FROM post_likes pl JOIN users u ON u.id = pl.user_id
+            WHERE pl.post_id = $1
+            ORDER BY pl.created_at DESC
+            LIMIT $2
+        `, [postId, limit]);
+        return result.rows.map(r => r.username);
+    },
+
+    // Social: Follows
+    async followUser({ followerUsername, followingUsername }) {
+        if (followerUsername === followingUsername) return { ok: true };
+        const [followerRes, followingRes] = await Promise.all([
+            pool.query('SELECT id FROM users WHERE username = $1', [followerUsername]),
+            pool.query('SELECT id FROM users WHERE username = $1', [followingUsername])
+        ]);
+        const follower = followerRes.rows[0];
+        const following = followingRes.rows[0];
+        if (!follower || !following) throw new Error('User not found');
+        await pool.query('INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [follower.id, following.id]);
+        return { ok: true };
+    },
+
+    async unfollowUser({ followerUsername, followingUsername }) {
+        const [followerRes, followingRes] = await Promise.all([
+            pool.query('SELECT id FROM users WHERE username = $1', [followerUsername]),
+            pool.query('SELECT id FROM users WHERE username = $1', [followingUsername])
+        ]);
+        const follower = followerRes.rows[0];
+        const following = followingRes.rows[0];
+        if (!follower || !following) throw new Error('User not found');
+        await pool.query('DELETE FROM follows WHERE follower_id = $1 AND following_id = $2', [follower.id, following.id]);
+        return { ok: true };
+    },
+
+    async getFollowing(username) {
+        const result = await pool.query(`
+            SELECT u2.username
+            FROM follows f
+            JOIN users u1 ON u1.id = f.follower_id
+            JOIN users u2 ON u2.id = f.following_id
+            WHERE u1.username = $1
+            ORDER BY u2.username
+        `, [username]);
+        return result.rows.map(r => r.username);
+    },
+
+    async getFollowers(username) {
+        const result = await pool.query(`
+            SELECT u1.username
+            FROM follows f
+            JOIN users u1 ON u1.id = f.follower_id
+            JOIN users u2 ON u2.id = f.following_id
+            WHERE u2.username = $1
+            ORDER BY u1.username
+        `, [username]);
+        return result.rows.map(r => r.username);
     }
 };
 
