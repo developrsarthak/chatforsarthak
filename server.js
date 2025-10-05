@@ -3,6 +3,8 @@ const http = require('http');
 const socketIo = require('socket.io');
 const path = require('path');
 const os = require('os');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
 // Import database functions
@@ -13,10 +15,213 @@ const server = http.createServer(app);
 const io = socketIo(server);
 
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 
 // Middleware
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
+
+// Auth helpers
+function generateToken(user) {
+    return jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+}
+
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+    try {
+        const payload = jwt.verify(token, JWT_SECRET);
+        req.user = payload;
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+}
+
+// Auth routes
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        if (!username || !password) {
+            return res.status(400).json({ error: 'Username and password are required' });
+        }
+        const existing = await db.getUserByUsername(username);
+        if (existing) return res.status(409).json({ error: 'Username already exists' });
+        const passwordHash = await bcrypt.hash(password, 10);
+        const user = await db.createUser(username, email || null, passwordHash);
+        const token = generateToken(user);
+        res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+    } catch (error) {
+        console.error('Error in register:', error);
+        res.status(500).json({ error: 'Registration failed' });
+    }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
+        const user = await db.getUserByUsername(username);
+        if (!user || !user.password_hash) return res.status(401).json({ error: 'Invalid credentials' });
+        const ok = await bcrypt.compare(password, user.password_hash);
+        if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+        const token = generateToken(user);
+        res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+    } catch (error) {
+        console.error('Error in login:', error);
+        res.status(500).json({ error: 'Login failed' });
+    }
+});
+
+// Social API routes
+app.post('/api/posts', authenticateToken, async (req, res) => {
+    try {
+        const { content } = req.body;
+        if (!content || !content.trim()) return res.status(400).json({ error: 'Content is required' });
+        const post = await db.createPost({ username: req.user.username, content: content.trim() });
+        io.emit('post created', post);
+        res.status(201).json(post);
+    } catch (error) {
+        console.error('Error creating post:', error);
+        res.status(500).json({ error: 'Failed to create post' });
+    }
+});
+
+app.get('/api/feed', authenticateToken, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 30;
+        const beforeId = req.query.beforeId ? parseInt(req.query.beforeId) : null;
+        const feed = await db.getFeedForUser(req.user.username, limit, beforeId);
+        res.json(feed);
+    } catch (error) {
+        console.error('Error fetching feed:', error);
+        res.status(500).json({ error: 'Failed to fetch feed' });
+    }
+});
+
+app.get('/api/users/:username/posts', async (req, res) => {
+    try {
+        const { username } = req.params;
+        const limit = parseInt(req.query.limit) || 20;
+        const beforeId = req.query.beforeId ? parseInt(req.query.beforeId) : null;
+        const posts = await db.getUserPosts(username, limit, beforeId);
+        res.json(posts);
+    } catch (error) {
+        console.error('Error fetching user posts:', error);
+        res.status(500).json({ error: 'Failed to fetch user posts' });
+    }
+});
+
+app.delete('/api/posts/:postId', authenticateToken, async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const deleted = await db.deletePost(parseInt(postId), req.user.username);
+        if (!deleted) return res.status(404).json({ error: 'Post not found or unauthorized' });
+        io.emit('post deleted', { postId: parseInt(postId) });
+        res.json({ success: true, deleted });
+    } catch (error) {
+        console.error('Error deleting post:', error);
+        res.status(500).json({ error: 'Failed to delete post' });
+    }
+});
+
+app.post('/api/posts/:postId/comments', authenticateToken, async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const { content } = req.body;
+        if (!content || !content.trim()) return res.status(400).json({ error: 'Content is required' });
+        const comment = await db.addComment({ postId: parseInt(postId), username: req.user.username, content: content.trim() });
+        io.emit('comment added', { postId: parseInt(postId), comment });
+        res.status(201).json(comment);
+    } catch (error) {
+        console.error('Error adding comment:', error);
+        res.status(500).json({ error: 'Failed to add comment' });
+    }
+});
+
+app.get('/api/posts/:postId/comments', async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const limit = parseInt(req.query.limit) || 50;
+        const beforeId = req.query.beforeId ? parseInt(req.query.beforeId) : null;
+        const comments = await db.getComments(parseInt(postId), limit, beforeId);
+        res.json(comments);
+    } catch (error) {
+        console.error('Error fetching comments:', error);
+        res.status(500).json({ error: 'Failed to fetch comments' });
+    }
+});
+
+app.post('/api/posts/:postId/like', authenticateToken, async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const post = await db.likePost({ postId: parseInt(postId), username: req.user.username });
+        io.emit('post like updated', { postId: parseInt(postId), likeCount: post.like_count, username: req.user.username, action: 'like' });
+        res.json(post);
+    } catch (error) {
+        console.error('Error liking post:', error);
+        res.status(500).json({ error: 'Failed to like post' });
+    }
+});
+
+app.delete('/api/posts/:postId/like', authenticateToken, async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const post = await db.unlikePost({ postId: parseInt(postId), username: req.user.username });
+        io.emit('post like updated', { postId: parseInt(postId), likeCount: post.like_count, username: req.user.username, action: 'unlike' });
+        res.json(post);
+    } catch (error) {
+        console.error('Error unliking post:', error);
+        res.status(500).json({ error: 'Failed to unlike post' });
+    }
+});
+
+app.post('/api/follow/:username', authenticateToken, async (req, res) => {
+    try {
+        const { username } = req.params;
+        await db.followUser({ followerUsername: req.user.username, followingUsername: username });
+        io.emit('user followed', { followerUsername: req.user.username, followingUsername: username });
+        res.json({ ok: true });
+    } catch (error) {
+        console.error('Error following user:', error);
+        res.status(500).json({ error: 'Failed to follow user' });
+    }
+});
+
+app.delete('/api/follow/:username', authenticateToken, async (req, res) => {
+    try {
+        const { username } = req.params;
+        await db.unfollowUser({ followerUsername: req.user.username, followingUsername: username });
+        io.emit('user unfollowed', { followerUsername: req.user.username, followingUsername: username });
+        res.json({ ok: true });
+    } catch (error) {
+        console.error('Error unfollowing user:', error);
+        res.status(500).json({ error: 'Failed to unfollow user' });
+    }
+});
+
+app.get('/api/users/:username/following', async (req, res) => {
+    try {
+        const { username } = req.params;
+        const following = await db.getFollowing(username);
+        res.json(following);
+    } catch (error) {
+        console.error('Error fetching following:', error);
+        res.status(500).json({ error: 'Failed to fetch following' });
+    }
+});
+
+app.get('/api/users/:username/followers', async (req, res) => {
+    try {
+        const { username } = req.params;
+        const followers = await db.getFollowers(username);
+        res.json(followers);
+    } catch (error) {
+        console.error('Error fetching followers:', error);
+        res.status(500).json({ error: 'Failed to fetch followers' });
+    }
+});
 
 // API Routes
 app.get('/api/stats', async (req, res) => {
